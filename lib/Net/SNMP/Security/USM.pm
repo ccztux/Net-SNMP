@@ -26,8 +26,9 @@ use Net::SNMP::Message qw(
 use Crypt::DES();
 use Digest::MD5();
 use Digest::SHA();
-use Digest::HMAC_MD5();
-use Digest::HMAC_SHA1();
+
+use Digest::SHA qw( hmac_sha1 hmac_sha224 hmac_sha256 hmac_sha384 hmac_sha512 );
+use Digest::HMAC_MD5 qw ( hmac_md5 );
 
 ## Version of the Net::SNMP::Security::USM module
 
@@ -41,7 +42,9 @@ our @EXPORT_OK;
 
 our %EXPORT_TAGS = (
    authprotos => [
-      qw( AUTH_PROTOCOL_NONE AUTH_PROTOCOL_HMACMD5 AUTH_PROTOCOL_HMACSHA )
+      qw( AUTH_PROTOCOL_NONE AUTH_PROTOCOL_HMACMD5 AUTH_PROTOCOL_HMACSHA
+          AUTH_PROTOCOL_HMACSHA224 AUTH_PROTOCOL_HMACSHA256
+          AUTH_PROTOCOL_HMACSHA384 AUTH_PROTOCOL_HMACSHA512 )
    ],
    levels     => [
       qw( SECURITY_LEVEL_NOAUTHNOPRIV SECURITY_LEVEL_AUTHNOPRIV
@@ -54,7 +57,8 @@ our %EXPORT_TAGS = (
    privprotos => [
       qw( PRIV_PROTOCOL_NONE PRIV_PROTOCOL_DES PRIV_PROTOCOL_AESCFB128
           PRIV_PROTOCOL_DRAFT_3DESEDE PRIV_PROTOCOL_DRAFT_AESCFB128
-          PRIV_PROTOCOL_DRAFT_AESCFB192 PRIV_PROTOCOL_DRAFT_AESCFB256 )
+          PRIV_PROTOCOL_DRAFT_AESCFB192 PRIV_PROTOCOL_DRAFT_AESCFB256
+          PRIV_PROTOCOL_AESCFB192_CISCO PRIV_PROTOCOL_AESCFB256_CISCO )
    ],
 );
 
@@ -64,9 +68,13 @@ $EXPORT_TAGS{ALL} = [ @EXPORT_OK ];
 
 ## RCC 3414 - Authentication protocols
 
-sub AUTH_PROTOCOL_NONE    { '1.3.6.1.6.3.10.1.1.1' } # usmNoAuthProtocol
-sub AUTH_PROTOCOL_HMACMD5 { '1.3.6.1.6.3.10.1.1.2' } # usmHMACMD5AuthProtocol
-sub AUTH_PROTOCOL_HMACSHA { '1.3.6.1.6.3.10.1.1.3' } # usmHMACSHAAuthProtocol
+sub AUTH_PROTOCOL_NONE       { '1.3.6.1.6.3.10.1.1.1' } # usmNoAuthProtocol
+sub AUTH_PROTOCOL_HMACMD5    { '1.3.6.1.6.3.10.1.1.2' } # usmHMACMD5AuthProtocol
+sub AUTH_PROTOCOL_HMACSHA    { '1.3.6.1.6.3.10.1.1.3' } # usmHMACSHAAuthProtocol
+sub AUTH_PROTOCOL_HMACSHA224 { '1.3.6.1.6.3.10.1.1.4' } # usmHMAC128SHA224AuthProtocol
+sub AUTH_PROTOCOL_HMACSHA256 { '1.3.6.1.6.3.10.1.1.5' } # usmHMAC192SHA256AuthProtocol
+sub AUTH_PROTOCOL_HMACSHA384 { '1.3.6.1.6.3.10.1.1.6' } # usmHMAC256SHA384AuthProtocol
+sub AUTH_PROTOCOL_HMACSHA512 { '1.3.6.1.6.3.10.1.1.7' } # usmHMAC384SHA512AuthProtocol
 
 ## RFC 3414 - Privacy protocols
 
@@ -102,6 +110,12 @@ sub PRIV_PROTOCOL_DRAFT_AESCFB192  { '1.3.6.1.4.1.14832.1.3' }
 # usmAESCfb256PrivProtocol
 sub PRIV_PROTOCOL_DRAFT_AESCFB256  { '1.3.6.1.4.1.14832.1.4' }
 
+# cusmAESCfb192PrivProtocol
+sub PRIV_PROTOCOL_AESCFB192_CISCO  { '1.3.6.1.4.1.9.12.6.1.1' }
+
+# cusmAESCfb256PrivProtocol
+sub PRIV_PROTOCOL_AESCFB256_CISCO  { '1.3.6.1.4.1.9.12.6.1.2' }
+
 ## Package variables
 
 our $ENGINE_ID;  # Our authoritative snmpEngineID                                                         
@@ -125,6 +139,7 @@ sub new
       '_time_epoc'          => time(),                # snmpEngineBoots epoc
       '_user_name'          => q{},                   # securityName 
       '_auth_data'          => undef,                 # Authentication data
+      '_auth_maclen'        => undef,                 # MAC length
       '_auth_key'           => undef,                 # authKey 
       '_auth_password'      => undef,                 # Authentication password 
       '_auth_protocol'      => AUTH_PROTOCOL_HMACMD5, # authProtocol
@@ -281,10 +296,10 @@ sub generate_request_msg
    if ($pdu->security_level() > SECURITY_LEVEL_NOAUTHNOPRIV) {
 
       # Save the location to fill in msgAuthenticationParameters later
-      $auth_location = $msg->length() + 12 + length $pdu_buffer;
+      $auth_location = $msg->length() + $this->{_auth_maclen} + length $pdu_buffer;
 
       # Set the msgAuthenticationParameters to all zeros
-      $auth_params = pack 'x12';
+      $auth_params = pack "x$this->{_auth_maclen}";
    }
 
    if (!defined $msg->prepare(OCTET_STRING, $auth_params)) {
@@ -419,12 +434,12 @@ sub process_incoming_msg
    # to compute the HMAC properly.
 
    if (my $len = length $auth_params) {
-      if ($len != 12) {
+      if ($len != $this->{_auth_maclen}) {
          return $this->_error(
             'The msgAuthenticationParameters length of %d is invalid', $len
          );
       }
-      substr ${$msg->reference}, ($msg->index() - 12), 12, pack 'x12';
+      substr ${$msg->reference}, ($msg->index() - $this->{_auth_maclen}), $this->{_auth_maclen}, pack "x$this->{_auth_maclen}";
    }
 
    # msgPrivacyParameters::=OCTET STRING
@@ -509,7 +524,9 @@ sub process_incoming_msg
 
          if (($this->{_priv_protocol} eq PRIV_PROTOCOL_AESCFB128)       ||
              ($this->{_priv_protocol} eq PRIV_PROTOCOL_DRAFT_AESCFB192) ||
-             ($this->{_priv_protocol} eq PRIV_PROTOCOL_DRAFT_AESCFB256))
+             ($this->{_priv_protocol} eq PRIV_PROTOCOL_DRAFT_AESCFB256) ||
+             ($this->{_priv_protocol} eq PRIV_PROTOCOL_AESCFB192_CISCO) ||
+             ($this->{_priv_protocol} eq PRIV_PROTOCOL_AESCFB256_CISCO))
          {
             substr $priv_params, 0, 0, pack 'NN', $msg_engine_boots,
                                                   $msg_engine_time;
@@ -748,6 +765,18 @@ sub _auth_password
       quotemeta AUTH_PROTOCOL_HMACMD5,   AUTH_PROTOCOL_HMACMD5,
       '(?:hmac-)?sha(?:-?1|-96)?',       AUTH_PROTOCOL_HMACSHA,
       quotemeta AUTH_PROTOCOL_HMACSHA,   AUTH_PROTOCOL_HMACSHA,
+      '(?:hmac-)?sha-?224',              AUTH_PROTOCOL_HMACSHA224,
+      'usmHMAC128SHA224AuthProtocol',    AUTH_PROTOCOL_HMACSHA224,
+      quotemeta AUTH_PROTOCOL_HMACSHA224,AUTH_PROTOCOL_HMACSHA224,
+      '(?:hmac-)?sha-?256',              AUTH_PROTOCOL_HMACSHA256,
+      'usmHMAC192SHA256AuthProtocol',    AUTH_PROTOCOL_HMACSHA256,
+      quotemeta AUTH_PROTOCOL_HMACSHA256,AUTH_PROTOCOL_HMACSHA256,
+      '(?:hmac-)?sha-?384',              AUTH_PROTOCOL_HMACSHA384,
+      'usmHMAC256SHA384AuthProtocol',    AUTH_PROTOCOL_HMACSHA384,
+      quotemeta AUTH_PROTOCOL_HMACSHA384,AUTH_PROTOCOL_HMACSHA384,
+      '(?:hmac-)?sha-?512',              AUTH_PROTOCOL_HMACSHA512,
+      'usmHMAC384SHA512AuthProtocol',    AUTH_PROTOCOL_HMACSHA512,
+      quotemeta AUTH_PROTOCOL_HMACSHA512,AUTH_PROTOCOL_HMACSHA512,
    };
 
    sub _auth_protocol
@@ -820,6 +849,10 @@ sub _priv_password
       quotemeta PRIV_PROTOCOL_DRAFT_AESCFB192,  PRIV_PROTOCOL_DRAFT_AESCFB192,
       '(?:(?:cfb)?256-?)aes(?:-?128)?',         PRIV_PROTOCOL_DRAFT_AESCFB256,
       quotemeta PRIV_PROTOCOL_DRAFT_AESCFB256,  PRIV_PROTOCOL_DRAFT_AESCFB256,
+      quotemeta PRIV_PROTOCOL_AESCFB192_CISCO,  PRIV_PROTOCOL_AESCFB192_CISCO,
+      quotemeta PRIV_PROTOCOL_AESCFB256_CISCO,  PRIV_PROTOCOL_AESCFB256_CISCO,
+      'aes192c', PRIV_PROTOCOL_AESCFB192_CISCO,
+      'aes256c', PRIV_PROTOCOL_AESCFB256_CISCO,
    };
 
    sub _priv_protocol
@@ -853,7 +886,9 @@ sub _priv_password
 
       if (($priv_proto eq PRIV_PROTOCOL_AESCFB128)       ||
           ($priv_proto eq PRIV_PROTOCOL_DRAFT_AESCFB192) ||
-          ($priv_proto eq PRIV_PROTOCOL_DRAFT_AESCFB256))
+          ($priv_proto eq PRIV_PROTOCOL_DRAFT_AESCFB256) ||
+          ($priv_proto eq PRIV_PROTOCOL_AESCFB192_CISCO) ||
+          ($priv_proto eq PRIV_PROTOCOL_AESCFB256_CISCO))
       {
          if (defined (my $error = load_module('Crypt::Rijndael'))) {
             return $this->_error(
@@ -1100,7 +1135,7 @@ sub _authenticate_outgoing_msg
    }
 
    # Set the msgAuthenticationParameters
-   substr ${$msg->reference}, -$auth_location, 12, $this->_auth_hmac($msg);
+   substr ${$msg->reference}, -$auth_location, $this->{_auth_maclen}, $this->_auth_hmac($msg);
 
    return TRUE;
 }
@@ -1126,7 +1161,7 @@ sub _auth_hmac
    return q{} if (!defined($this->{_auth_data}) || !defined $msg);
 
    return substr
-      $this->{_auth_data}->reset()->add(${$msg->reference()})->digest(), 0, 12;
+      $this->{_auth_data}(${$msg->reference()}, $this->{_auth_key}), 0, $this->{_auth_maclen};
 }
 
 sub _auth_data_init
@@ -1141,16 +1176,35 @@ sub _auth_data_init
 
    if ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACMD5) {
 
-      $this->{_auth_data} =
-         Digest::HMAC_MD5->new($this->{_auth_key});
+      $this->{_auth_data} = \&hmac_md5;
+      $this->{_auth_maclen} = 12;
 
    } elsif ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA) {
 
-      $this->{_auth_data} =
-         Digest::HMAC_SHA1->new($this->{_auth_key});
+      $this->{_auth_data} = \&hmac_sha1;
+      $this->{_auth_maclen} = 12;
+
+   } elsif ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA224) {
+
+      $this->{_auth_data} = \&hmac_sha224;
+      $this->{_auth_maclen} = 16;
+
+   } elsif ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA256) {
+
+      $this->{_auth_data} = \&hmac_sha256;
+      $this->{_auth_maclen} = 24;
+
+   } elsif ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA384) {
+
+      $this->{_auth_data} = \&hmac_sha384;
+      $this->{_auth_maclen} = 32;
+
+   } elsif ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA512) {
+
+      $this->{_auth_data} = \&hmac_sha512;
+      $this->{_auth_maclen} = 48;
 
    } else {
-
       return $this->_error(
          'The authProtocol "%s" is unknown', $this->{_auth_protocol}
       );
@@ -1167,7 +1221,9 @@ sub _auth_data_init
       PRIV_PROTOCOL_DRAFT_3DESEDE,    \&_priv_encrypt_3desede,
       PRIV_PROTOCOL_AESCFB128,        \&_priv_encrypt_aescfbxxx,
       PRIV_PROTOCOL_DRAFT_AESCFB192,  \&_priv_encrypt_aescfbxxx,
-      PRIV_PROTOCOL_DRAFT_AESCFB256,  \&_priv_encrypt_aescfbxxx
+      PRIV_PROTOCOL_DRAFT_AESCFB256,  \&_priv_encrypt_aescfbxxx,
+      PRIV_PROTOCOL_AESCFB192_CISCO,  \&_priv_encrypt_aescfbxxx,
+      PRIV_PROTOCOL_AESCFB256_CISCO,  \&_priv_encrypt_aescfbxxx
    };
 
    sub _encrypt_data
@@ -1200,7 +1256,9 @@ sub _auth_data_init
       PRIV_PROTOCOL_DRAFT_3DESEDE,    \&_priv_decrypt_3desede,
       PRIV_PROTOCOL_AESCFB128,        \&_priv_decrypt_aescfbxxx,
       PRIV_PROTOCOL_DRAFT_AESCFB192,  \&_priv_decrypt_aescfbxxx,
-      PRIV_PROTOCOL_DRAFT_AESCFB256,  \&_priv_decrypt_aescfbxxx
+      PRIV_PROTOCOL_DRAFT_AESCFB256,  \&_priv_decrypt_aescfbxxx,
+      PRIV_PROTOCOL_AESCFB192_CISCO,  \&_priv_decrypt_aescfbxxx,
+      PRIV_PROTOCOL_AESCFB256_CISCO,  \&_priv_decrypt_aescfbxxx
    };
 
    sub _decrypt_data
@@ -1261,7 +1319,9 @@ sub _priv_data_init
       PRIV_PROTOCOL_DRAFT_3DESEDE,    \&_priv_data_init_3desede,
       PRIV_PROTOCOL_AESCFB128,        \&_priv_data_init_aescfbxxx,
       PRIV_PROTOCOL_DRAFT_AESCFB192,  \&_priv_data_init_aescfbxxx,
-      PRIV_PROTOCOL_DRAFT_AESCFB256,  \&_priv_data_init_aescfbxxx
+      PRIV_PROTOCOL_DRAFT_AESCFB256,  \&_priv_data_init_aescfbxxx,
+      PRIV_PROTOCOL_AESCFB192_CISCO,  \&_priv_data_init_aescfbxxx,
+      PRIV_PROTOCOL_AESCFB256_CISCO,  \&_priv_data_init_aescfbxxx
    };
 
    if (!exists $init->{$this->{_priv_protocol}}) {
@@ -1391,7 +1451,12 @@ sub _priv_data_init_3desede
 
    if ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACMD5) {
       $this->{_priv_data}->{hash} = Digest::MD5->new();
-   } elsif ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA) {
+   } elsif (($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA) ||
+            ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA224) ||
+            ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA256) ||
+            ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA384) ||
+            ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA512))
+   {
       $this->{_priv_data}->{hash} = Digest::SHA->new();
    }
 
@@ -1628,6 +1693,10 @@ sub _auth_key_validate
    {
       AUTH_PROTOCOL_HMACMD5,    [ 16, 'HMAC-MD5'  ],
       AUTH_PROTOCOL_HMACSHA,    [ 20, 'HMAC-SHA1' ],
+      AUTH_PROTOCOL_HMACSHA224, [ 28, 'HMAC-SHA224' ],
+      AUTH_PROTOCOL_HMACSHA256, [ 32, 'HMAC-SHA256' ],
+      AUTH_PROTOCOL_HMACSHA384, [ 48, 'HMAC-SHA384' ],
+      AUTH_PROTOCOL_HMACSHA512, [ 64, 'HMAC-SHA512' ],
    };
 
    if (!exists $key_len->{$this->{_auth_protocol}}) {
@@ -1660,12 +1729,16 @@ sub _priv_key_generate
 
    return $this->_error() if !defined $this->{_priv_key};
 
-   if ($this->{_priv_protocol} eq PRIV_PROTOCOL_DRAFT_3DESEDE) {
-
+   if (($this->{_priv_protocol} eq PRIV_PROTOCOL_DRAFT_3DESEDE) ||
+       ($this->{_priv_protocol} eq PRIV_PROTOCOL_AESCFB192_CISCO) ||
+       ($this->{_priv_protocol} eq PRIV_PROTOCOL_AESCFB256_CISCO))
+   {
       # Draft 3DES-EDE for USM Section 2.1 - "To acquire the necessary 
       # number of key bits, the password-to-key algorithm may be chained
       # using its output as further input in order to generate an
       # appropriate number of key bits."
+
+      # Cisco AES192 and AES256 use the same key extension mechanism
 
       $this->{_priv_key} .= $this->_password_localize($this->{_priv_key});
 
@@ -1681,7 +1754,12 @@ sub _priv_key_generate
 
       if ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACMD5) {
          $hnnn = Digest::MD5->new();
-      } elsif ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA) {
+      } elsif (($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA) ||
+               ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA224) ||
+               ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA256) ||
+               ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA384) ||
+               ($this->{_auth_protocol} eq AUTH_PROTOCOL_HMACSHA512))
+      {
          $hnnn = Digest::SHA->new();
       } else {
          return $this->_error(
@@ -1701,7 +1779,9 @@ sub _priv_key_generate
       PRIV_PROTOCOL_DRAFT_3DESEDE,    32,  # Draft 3DES for USM Section 5.2.1
       PRIV_PROTOCOL_AESCFB128,        16,  # AES in the USM Section 3.2.1
       PRIV_PROTOCOL_DRAFT_AESCFB192,  24,  # Draft AES in the USM Section 3.2.1
-      PRIV_PROTOCOL_DRAFT_AESCFB256,  32   # Draft AES in the USM Section 3.2.1
+      PRIV_PROTOCOL_DRAFT_AESCFB256,  32,  # Draft AES in the USM Section 3.2.1
+      PRIV_PROTOCOL_AESCFB192_CISCO,  24,
+      PRIV_PROTOCOL_AESCFB256_CISCO,  32
    };
 
    if (!exists $key_len->{$this->{_priv_protocol}}) {
@@ -1726,7 +1806,9 @@ sub _priv_key_validate
       PRIV_PROTOCOL_DRAFT_3DESEDE,    [ 32, 'CBC-3DES-EDE'   ],
       PRIV_PROTOCOL_AESCFB128,        [ 16, 'CFB128-AES-128' ],
       PRIV_PROTOCOL_DRAFT_AESCFB192,  [ 24, 'CFB128-AES-192' ],
-      PRIV_PROTOCOL_DRAFT_AESCFB256,  [ 32, 'CFB128-AES-256' ]
+      PRIV_PROTOCOL_DRAFT_AESCFB256,  [ 32, 'CFB128-AES-256' ],
+      PRIV_PROTOCOL_AESCFB192_CISCO,  [ 24, 'CFB128-AES-192c' ],
+      PRIV_PROTOCOL_AESCFB256_CISCO,  [ 32, 'CFB128-AES-256c' ]
    };
 
    if (!exists $key_len->{$this->{_priv_protocol}}) {
@@ -1783,8 +1865,12 @@ sub _password_localize
 
    my $digests =
    {
-      AUTH_PROTOCOL_HMACMD5,  'Digest::MD5',
-      AUTH_PROTOCOL_HMACSHA,  'Digest::SHA',
+      AUTH_PROTOCOL_HMACMD5,    ['Digest::MD5', ],
+      AUTH_PROTOCOL_HMACSHA,    ['Digest::SHA', 1],
+      AUTH_PROTOCOL_HMACSHA224, ['Digest::SHA', 224],
+      AUTH_PROTOCOL_HMACSHA256, ['Digest::SHA', 256],
+      AUTH_PROTOCOL_HMACSHA384, ['Digest::SHA', 384],
+      AUTH_PROTOCOL_HMACSHA512, ['Digest::SHA', 512],
    };
 
    if (!exists $digests->{$this->{_auth_protocol}}) {
@@ -1793,7 +1879,12 @@ sub _password_localize
       );
    }
 
-   my $digest = $digests->{$this->{_auth_protocol}}->new;
+   my $digest;
+   if (!defined($digests->{$this->{_auth_protocol}}[1])) {
+         $digest = $digests->{$this->{_auth_protocol}}[0]->new;
+   } else {
+         $digest = $digests->{$this->{_auth_protocol}}[0]->new($digests->{$this->{_auth_protocol}}[1]);
+   }
 
    # Create the initial digest using the password
 
@@ -1845,4 +1936,3 @@ sub _password_localize
 
 # ============================================================================
 1; # [end Net::SNMP::Security::USM]
-
